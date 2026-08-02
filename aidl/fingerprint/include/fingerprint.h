@@ -286,11 +286,11 @@ typedef struct fingerprint_module {
 } fingerprint_module_t;
 
 typedef struct rbs_fingerprint_device {
-    int (*rbs_initialize)(int, int);
+    int (*rbs_initialize)(const void* hwid, uint32_t hwid_size);
     int (*rbs_uninitialize)(void);
     int (*rbs_cancel)(void*, uint32_t);
     int (*rbs_active_user_group)(uint32_t gid, const char* store_path);
-    int (*rbs_set_data_path)(int, const char*);
+    int (*rbs_set_data_path)(int, const char*, uint32_t path_size);
     int (*rbs_chk_secure_id)(uint32_t gid, uint64_t user_id);
     int (*rbs_pre_enroll)(uint32_t gid, uint32_t seed);
     int (*rbs_enroll)(void);
@@ -302,6 +302,9 @@ typedef struct rbs_fingerprint_device {
     int (*rbs_get_authenticator_id)(uint64_t* authenticator_id);
     int (*rbs_set_on_callback_proc)(void* callback_proc);
     int (*rbs_extra_api)(uint32_t, const uint8_t*, uint32_t, uint8_t*, uint32_t*);
+    void* rbs_check_hwid;
+    bool uses_hwid_protocol;
+    void* library_handle;
 } rbs_fingerprint_device_t;
 
 typedef struct anc_fingerprint_device {

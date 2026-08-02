@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <fingerprint.sysprop.h>
 #include <unistd.h>
+#include <vector>
 #include "util/Util.h"
 
 namespace aidl::android::hardware::biometrics::fingerprint {
@@ -34,6 +35,81 @@ static const fingerprint_hal_t kModules[] = {
         {"fortsense"},  {"fpc"},         {"fpc_fod"}, {"goodix"}, {"goodix:gf_fingerprint"},
         {"goodix_fod"}, {"goodix_fod6"}, {"silead"},  {"syna"},
 };
+
+constexpr char RBS_TEE_CLIENT_LIBRARY[] = "libets_teeclient_v2.so";
+constexpr char RBS_TEE_APP_NAME[] = "keymaster64";
+constexpr uint32_t RBS_TEE_APP_BUFFER_SIZE = 0x2400;
+constexpr uint32_t RBS_HWID_COMMAND = 0x205;
+constexpr uint32_t RBS_HWID_OPERATION = 2;
+constexpr size_t RBS_HWID_MAX_SIZE = 256;
+constexpr char RBS_DEFAULT_DATA_PATH[] = "/data/vendor_de/0/fpdata/";
+
+struct RbsHwidRequest {
+    uint32_t command;
+    uint32_t operation;
+};
+
+struct RbsHwidResponse {
+    int32_t status;
+    uint32_t reserved;
+    uint32_t dataSize;
+    uint8_t data[1024];
+};
+
+using QscStartApp = int (*)(void**, const char*, uint32_t);
+using QscShutdownApp = int (*)(void**);
+using EtsSendCommand = int (*)(void*, const void*, uint32_t, void*, uint32_t*);
+
+bool getRbsHardwareId(std::vector<uint8_t>* hwid) {
+    void* teeClient = dlopen(RBS_TEE_CLIENT_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+    if (!teeClient) {
+        ALOGE("Failed to dlopen %s: %s", RBS_TEE_CLIENT_LIBRARY, dlerror());
+        return false;
+    }
+
+    auto startApp = reinterpret_cast<QscStartApp>(dlsym(teeClient, "qsc_start_app"));
+    auto shutdownApp = reinterpret_cast<QscShutdownApp>(dlsym(teeClient, "qsc_shutdown_app"));
+    auto sendCommand = reinterpret_cast<EtsSendCommand>(
+            dlsym(teeClient, "ets_keymaster_issue_send_modified_cmd_req"));
+    if (!startApp || !shutdownApp || !sendCommand) {
+        ALOGE("Failed to load Egis TEE client symbols: %s", dlerror());
+        dlclose(teeClient);
+        return false;
+    }
+
+    void* teeApp = nullptr;
+    int err = startApp(&teeApp, RBS_TEE_APP_NAME, RBS_TEE_APP_BUFFER_SIZE);
+    if (err != 0 || !teeApp) {
+        ALOGE("Failed to start Egis TEE app, error: %d", err);
+        dlclose(teeClient);
+        return false;
+    }
+
+    const RbsHwidRequest request = {RBS_HWID_COMMAND, RBS_HWID_OPERATION};
+    RbsHwidResponse response = {};
+    uint32_t responseSize = sizeof(response);
+    err = sendCommand(teeApp, &request, sizeof(request), &response, &responseSize);
+
+    bool success = false;
+    if (err != 0) {
+        ALOGE("Failed to request Egis HWID, error: %d", err);
+    } else if (response.status != 0) {
+        ALOGE("Egis HWID request failed, status: %d", response.status);
+    } else if (response.dataSize == 0 || response.dataSize > sizeof(response.data) ||
+               response.dataSize > RBS_HWID_MAX_SIZE) {
+        ALOGE("Invalid Egis HWID size: %u", response.dataSize);
+    } else {
+        hwid->assign(response.data, response.data + response.dataSize);
+        success = true;
+    }
+
+    int shutdownError = shutdownApp(&teeApp);
+    if (shutdownError != 0) {
+        ALOGW("Failed to stop Egis TEE app, error: %d", shutdownError);
+    }
+    dlclose(teeClient);
+    return success;
+}
 
 }  // namespace
 
@@ -123,6 +199,7 @@ Fingerprint::~Fingerprint() {
     }
     if (mRbsDevice) {
         mRbsDevice->rbs_uninitialize();
+        dlclose(mRbsDevice->library_handle);
         free(mRbsDevice);
         mRbsDevice = nullptr;
     }
@@ -183,15 +260,19 @@ rbs_fingerprint_device_t* Fingerprint::openRbsFingerprintHal() {
                      access("/dev/egis", F_OK) == 0 || access("/dev/esfp0", F_OK) == 0);
     if (!has_egis) return nullptr;
 
-    void* rbs_handle = dlopen("libRbsFlow.so", RTLD_NOW);
+    void* rbs_handle = dlopen("libRbsFlow.so", RTLD_NOW | RTLD_LOCAL);
     if (rbs_handle == nullptr) {
         ALOGE("Failed to dlopen libRbsFlow.so: %s", dlerror());
         return nullptr;
     }
 
     ALOGI("Detected Egistec RBS library");
-    auto rbsDevice = static_cast<rbs_fingerprint_device_t*>(malloc(sizeof(rbs_fingerprint_device_t)));
-    if (!rbsDevice) return nullptr;
+    auto rbsDevice = static_cast<rbs_fingerprint_device_t*>(calloc(1, sizeof(rbs_fingerprint_device_t)));
+    if (!rbsDevice) {
+        dlclose(rbs_handle);
+        return nullptr;
+    }
+    rbsDevice->library_handle = rbs_handle;
 
     rbsDevice->rbs_initialize = reinterpret_cast<typeof(rbsDevice->rbs_initialize)>(dlsym(rbs_handle, "rbs_initialize"));
     rbsDevice->rbs_uninitialize = reinterpret_cast<typeof(rbsDevice->rbs_uninitialize)>(dlsym(rbs_handle, "rbs_uninitialize"));
@@ -209,15 +290,45 @@ rbs_fingerprint_device_t* Fingerprint::openRbsFingerprintHal() {
     rbsDevice->rbs_get_authenticator_id = reinterpret_cast<typeof(rbsDevice->rbs_get_authenticator_id)>(dlsym(rbs_handle, "rbs_get_authenticator_id"));
     rbsDevice->rbs_set_on_callback_proc = reinterpret_cast<typeof(rbsDevice->rbs_set_on_callback_proc)>(dlsym(rbs_handle, "rbs_set_on_callback_proc"));
     rbsDevice->rbs_extra_api = reinterpret_cast<typeof(rbsDevice->rbs_extra_api)>(dlsym(rbs_handle, "rbs_extra_api"));
+    rbsDevice->rbs_check_hwid = dlsym(rbs_handle, "rbs_check_hwid");
+    rbsDevice->uses_hwid_protocol = rbsDevice->rbs_check_hwid != nullptr;
 
     if (rbsDevice->rbs_initialize && rbsDevice->rbs_uninitialize && rbsDevice->rbs_cancel &&
-        rbsDevice->rbs_active_user_group && rbsDevice->rbs_chk_secure_id && rbsDevice->rbs_pre_enroll &&
+        rbsDevice->rbs_active_user_group && rbsDevice->rbs_set_data_path &&
+        rbsDevice->rbs_chk_secure_id && rbsDevice->rbs_pre_enroll &&
         rbsDevice->rbs_enroll && rbsDevice->rbs_post_enroll && rbsDevice->rbs_chk_auth_token &&
         rbsDevice->rbs_authenticator && rbsDevice->rbs_remove_fingerprint && rbsDevice->rbs_get_fingerprint_ids &&
-        rbsDevice->rbs_get_authenticator_id && rbsDevice->rbs_set_on_callback_proc) {
+        rbsDevice->rbs_get_authenticator_id && rbsDevice->rbs_set_on_callback_proc &&
+        rbsDevice->rbs_extra_api) {
 
+        int err = rbsDevice->rbs_set_data_path(1, RBS_DEFAULT_DATA_PATH,
+                                               sizeof(RBS_DEFAULT_DATA_PATH) - 1);
+        if (err != 0) {
+            ALOGE("Can't set initial RBS data path, error: %d", err);
+            free(rbsDevice);
+            dlclose(rbs_handle);
+            return nullptr;
+        }
         rbsDevice->rbs_set_on_callback_proc(reinterpret_cast<void*>(Fingerprint::rbsNotify));
-        int err = rbsDevice->rbs_initialize(0, 0);
+
+        if (rbsDevice->uses_hwid_protocol) {
+            ALOGI("Using Egistec secure-HWID RBS protocol");
+            std::vector<uint8_t> hwid;
+            if (!getRbsHardwareId(&hwid)) {
+                usleep(200);
+                if (!getRbsHardwareId(&hwid)) {
+                    ALOGE("Can't obtain Egis HWID");
+                    free(rbsDevice);
+                    dlclose(rbs_handle);
+                    return nullptr;
+                }
+            }
+            err = rbsDevice->rbs_initialize(hwid.data(), hwid.size());
+        } else {
+            ALOGI("Using Egistec FOD RBS protocol");
+            err = rbsDevice->rbs_initialize(nullptr, 0);
+        }
+
         if (err == 0) {
             ALOGI("Initialized Egistec RBS fingerprint sensor successfully");
             return rbsDevice;
@@ -229,6 +340,7 @@ rbs_fingerprint_device_t* Fingerprint::openRbsFingerprintHal() {
     }
 
     free(rbsDevice);
+    dlclose(rbs_handle);
     return nullptr;
 }
 
@@ -243,9 +355,75 @@ void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t va
     fingerprint_msg_t msg;
     memset(&msg, 0, sizeof(msg));
 
+    if (!mRbsDevice || mRbsDevice->uses_hwid_protocol) {
+        switch (eventId) {
+            case 0x3e9:
+                msg.type = FINGERPRINT_ERROR;
+                msg.data.error = FINGERPRINT_ERROR_UNABLE_TO_PROCESS;
+                break;
+            case 0x413:
+                msg.type = FINGERPRINT_ERROR;
+                msg.data.error = FINGERPRINT_ERROR_TIMEOUT;
+                break;
+            case 0x416:
+                msg.type = FINGERPRINT_ERROR;
+                msg.data.error = FINGERPRINT_ERROR_NO_SPACE;
+                break;
+            case 0x3ec:
+            case 0x3ed:
+                msg.type = FINGERPRINT_ACQUIRED;
+                msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_TOO_SLOW;
+                break;
+            case 0x3ef:
+            case 0x3f0:
+                msg.type = FINGERPRINT_ACQUIRED;
+                msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_VENDOR_BASE;
+                break;
+            case 0x3f5:
+                msg.type = FINGERPRINT_ACQUIRED;
+                msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_INSUFFICIENT;
+                break;
+            case 0x3f7:
+            case 0x3f8:
+                msg.type = FINGERPRINT_ACQUIRED;
+                msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_PARTIAL;
+                break;
+            case 0x3f9:
+            case 0x3fa:
+            case 0x3fb:
+                msg.type = FINGERPRINT_ACQUIRED;
+                msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_TOO_FAST;
+                break;
+            case 0x3ff:
+                msg.type = FINGERPRINT_ACQUIRED;
+                msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_GOOD;
+                break;
+            case 0x410:
+                msg.type = FINGERPRINT_TEMPLATE_ENROLLING;
+                msg.data.enroll.finger.fid = value1;
+                msg.data.enroll.finger.gid = mSession ? mSession->getUserId() : 0;
+                msg.data.enroll.samples_remaining = value2;
+                break;
+            case 0x3f2:
+            case 0x3f3:
+                msg.type = FINGERPRINT_AUTHENTICATED;
+                msg.data.authenticated.finger.gid = value1;
+                msg.data.authenticated.finger.fid = value2;
+                if (value2 != 0 && buffer != nullptr) {
+                    memcpy(&msg.data.authenticated.hat, buffer, sizeof(hw_auth_token_t));
+                }
+                break;
+            default:
+                ALOGV("Ignoring secure-HWID RBS event %u", eventId);
+                return;
+        }
+        notify(&msg);
+        return;
+    }
+
     switch (eventId) {
+        case 0x3e9:
         case 0x3eb:
-        case 0x401:
             msg.type = FINGERPRINT_ERROR;
             msg.data.error = FINGERPRINT_ERROR_CANCELED;
             break;
@@ -260,6 +438,7 @@ void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t va
             break;
         case 0x3ee:
         case 0x3ef:
+        case 0x3f0:
             msg.type = FINGERPRINT_ACQUIRED;
             msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_VENDOR_BASE;
             break;
@@ -273,12 +452,14 @@ void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t va
             msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_PARTIAL;
             break;
         case 0x3f9:
-        case 0x3fa:
-        case 0x3fb:
             msg.type = FINGERPRINT_ACQUIRED;
             msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_TOO_FAST;
             break;
-        case 0x3fe:
+        case 0x3fd:
+            msg.type = FINGERPRINT_ACQUIRED;
+            msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_VENDOR_BASE;
+            break;
+        case 0x3ff:
             msg.type = FINGERPRINT_ACQUIRED;
             msg.data.acquired.acquired_info = FINGERPRINT_ACQUIRED_GOOD;
             break;
@@ -290,6 +471,7 @@ void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t va
             break;
         case 0x3f2:
         case 0x3f3:
+        case 0x424:
             msg.type = FINGERPRINT_AUTHENTICATED;
             msg.data.authenticated.finger.gid = value1;
             msg.data.authenticated.finger.fid = value2;
@@ -298,7 +480,7 @@ void Fingerprint::handleRbsNotify(uint32_t eventId, uint32_t value1, uint32_t va
             }
             break;
         default:
-            ALOGW("handleRbsNotify: unknown eventId %u", eventId);
+            ALOGV("Ignoring FOD RBS event %u", eventId);
             return;
     }
 

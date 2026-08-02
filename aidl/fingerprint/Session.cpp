@@ -47,7 +47,7 @@ Session::Session(fingerprint_device_t* device, rbs_fingerprint_device_t* rbsDevi
         if (rc != 0) {
             ALOGE("rbs_active_user_group failed, error: %d", rc);
         }
-        rc = mRbsDevice->rbs_set_data_path(1, path.c_str());
+        rc = mRbsDevice->rbs_set_data_path(1, path.c_str(), path.size());
         if (rc != 0) {
             ALOGE("rbs_set_data_path failed, error: %d", rc);
         }
@@ -146,7 +146,23 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
             return ndk::ScopedAStatus::ok();
         }
 
-        int rc = mRbsDevice->rbs_chk_auth_token(&authToken, sizeof(hw_auth_token_t));
+        int rc = 0;
+        if (mRbsDevice->uses_hwid_protocol) {
+            // The secure-HWID Egis service sends this request before validating the HAT.
+            // Passing a null payload here makes its libRbsFlow dereference a null pointer.
+            const uint32_t extraData[] = {2005, 2};
+            rc = mRbsDevice->rbs_extra_api(
+                    0, reinterpret_cast<const uint8_t*>(extraData), sizeof(extraData), nullptr,
+                    nullptr);
+            if (rc != 0) {
+                ALOGE("rbs_extra_api failed before enroll: %d", rc);
+                mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+                *out = SharedRefBase::make<CancellationSignal>(this);
+                return ndk::ScopedAStatus::ok();
+            }
+        }
+
+        rc = mRbsDevice->rbs_chk_auth_token(&authToken, sizeof(hw_auth_token_t));
         if (rc != 0) {
             ALOGE("Auth token check failed, error %d", rc);
             mCb->onError(Error::UNABLE_TO_PROCESS, rc);
@@ -169,13 +185,27 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
             }
         }
 
-        rc = mRbsDevice->rbs_pre_enroll(mUserId, 10);
+        do {
+            rc = mRbsDevice->rbs_pre_enroll(mUserId, static_cast<uint32_t>(rand()));
+        } while (rc == 11);
         if (rc != 0) {
             ALOGE("rbs_pre_enroll failed: %d", rc);
+            mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+            *out = SharedRefBase::make<CancellationSignal>(this);
+            return ndk::ScopedAStatus::ok();
         }
-        mRbsDevice->rbs_cancel(nullptr, 2);
-        if (mRbsDevice->rbs_extra_api) {
-            mRbsDevice->rbs_extra_api(3, nullptr, 0, nullptr, nullptr);
+
+        if (!mRbsDevice->uses_hwid_protocol) {
+            const uint32_t timeoutSeconds = 60;
+            rc = mRbsDevice->rbs_extra_api(
+                    8, reinterpret_cast<const uint8_t*>(&timeoutSeconds), sizeof(timeoutSeconds),
+                    nullptr, nullptr);
+            if (rc != 0) {
+                ALOGE("FOD RBS extra API failed before enroll: %d", rc);
+                mCb->onError(Error::UNABLE_TO_PROCESS, rc);
+                *out = SharedRefBase::make<CancellationSignal>(this);
+                return ndk::ScopedAStatus::ok();
+            }
         }
 
         rc = mRbsDevice->rbs_enroll();
